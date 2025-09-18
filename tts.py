@@ -1,19 +1,34 @@
 import subprocess
 import sys
 import asyncio
-import argparse
 import os
+from flask import Flask, request, jsonify
 from gtts import gTTS
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+
+# Configuration
+UPLOAD_FOLDER = 'uploads'
+OUTPUT_FOLDER = 'outputs'
+ALLOWED_EXTENSIONS = {'txt'}
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
+
+# Ensure folders exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 VOICE_MAP = {
     'ru': {'male': 'ru-RU-DmitryNeural', 'female': 'ru-RU-SvetlanaNeural'},
     'en': {'male': 'en-US-GuyNeural', 'female': 'en-US-JennyNeural'},
     'es': {'male': 'es-ES-AlvaroNeural', 'female': 'es-ES-ElviraNeural'},
-    'fr': {'male': 'fr-FR-HenriNeural', 'female': 'fr-FR-DeniseNeural'},  # Note: Swapped male/female for fr as per original map
+    'fr': {'male': 'fr-FR-HenriNeural', 'female': 'fr-FR-DeniseNeural'},
     'de': {'male': 'de-DE-ConradNeural', 'female': 'de-DE-KatjaNeural'},
     'it': {'male': 'it-IT-DiegoNeural', 'female': 'it-IT-ElsaNeural'},
     'pt': {'male': 'pt-BR-AntonioNeural', 'female': 'pt-BR-FranciscaNeural'},
-    'ja': {'male': 'ja-JP-KeitaNeural', 'female': 'ja-JP-NanamiNeural'},  # Updated to valid voices
+    'ja': {'male': 'ja-JP-KeitaNeural', 'female': 'ja-JP-NanamiNeural'},
     'ko': {'male': 'ko-KR-InJoonNeural', 'female': 'ko-KR-SunHiNeural'},
     'zh': {'male': 'zh-CN-YunxiNeural', 'female': 'zh-CN-XiaoxiaoNeural'}
 }
@@ -31,6 +46,9 @@ GTTS_LANG_MAP = {
     'zh': 'zh'
 }
 
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
 def read_text_from_file(file_path):
     """Reads text from the given file path and returns it as a string."""
     try:
@@ -39,12 +57,8 @@ def read_text_from_file(file_path):
         if not text:
             raise ValueError("The input file is empty.")
         return text
-    except FileNotFoundError:
-        print(f"⚠️ File not found: {file_path}")
-        sys.exit(1)
     except Exception as e:
-        print(f"⚠️ Error reading file: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Error reading file: {e}")
 
 def generate_tts_audio(text, output_path, lang='ru', voice_gender='female'):
     """Generates TTS audio from text and saves it to output_path."""
@@ -66,7 +80,7 @@ def generate_tts_audio(text, output_path, lang='ru', voice_gender='female'):
         except ImportError:
             print("⚠️ Edge TTS not installed. Installing now...")
             subprocess.run([sys.executable, "-m", "pip", "install", "edge-tts"])
-            print("✅ Edge TTS installed. Please run the script again.")
+            print("✅ Edge TTS installed. Please restart the server.")
             return False
         except Exception as e:
             print(f"⚠️ Edge TTS failed: {e}. Falling back to gTTS.")
@@ -82,27 +96,44 @@ def generate_tts_audio(text, output_path, lang='ru', voice_gender='female'):
         print(f"⚠️ TTS error for \"{text[:30]}...\": {e}")
         return False
 
-def main():
-    parser = argparse.ArgumentParser(description="Console TTS utility: Generate audio from a text file.")
-    parser.add_argument('--input', required=True, help="Path to the input .txt file.")
-    parser.add_argument('--output', default='output.mp3', help="Path to save the output audio file (default: output.mp3).")
-    parser.add_argument('--lang', default='ru', choices=VOICE_MAP.keys(), help="Language code (default: ru).")
-    parser.add_argument('--gender', default='female', choices=['male', 'female'], help="Voice gender (default: female).")
-    
-    args = parser.parse_args()
-    
-    # Ensure output directory exists
-    output_dir = os.path.dirname(args.output)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    text = read_text_from_file(args.input)
-    success = generate_tts_audio(text, args.output, lang=args.lang, voice_gender=args.gender)
-    
-    if success:
-        print(f"🎉 Audio saved to {args.output}")
+@app.route('/generate-tts', methods=['POST'])
+def generate_tts():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        lang = request.form.get('lang', 'ru')
+        gender = request.form.get('gender', 'female')
+        
+        if lang not in VOICE_MAP:
+            return jsonify({'error': f'Invalid language: {lang}'}), 400
+        if gender not in ['male', 'female']:
+            return jsonify({'error': f'Invalid gender: {gender}'}), 400
+        
+        try:
+            text = read_text_from_file(file_path)
+            output_filename = f"{os.path.splitext(filename)[0]}.mp3"
+            output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+            
+            success = generate_tts_audio(text, output_path, lang=lang, voice_gender=gender)
+            
+            # Clean up uploaded file
+            os.remove(file_path)
+            
+            if success:
+                return jsonify({'message': 'Audio generated successfully', 'output_path': output_path}), 200
+            else:
+                return jsonify({'error': 'Failed to generate audio'}), 500
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
     else:
-        print("❌ Failed to generate audio.")
+        return jsonify({'error': 'Invalid file type'}), 400
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    app.run(debug=True)
